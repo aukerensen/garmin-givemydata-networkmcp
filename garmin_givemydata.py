@@ -59,6 +59,14 @@ DATA_DIR = _get_data_dir()
 PROFILE_DIR = DATA_DIR / "browser_profile"
 SESSION_FILE = DATA_DIR / "garmin_session.json"
 
+# Ensure SeleniumBase's UC-mode driver download/patch step (which writes to
+# downloaded_files/ relative to the CWD) lands somewhere writable. Without
+# this, a container/service CWD like `/` makes the chromedriver patch step
+# fail with FileNotFoundError. garmin_mcp/sync.py already applies the same
+# fix for the MCP-server code path (see its own comment, issue #35); this
+# was missing on the CLI entry point.
+os.chdir(str(DATA_DIR))
+
 # ─── Fetch profiles ──────────────────────────────────────────
 FETCH_PROFILES = {
     "all": {
