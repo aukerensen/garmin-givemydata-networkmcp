@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import fcntl
 import logging
 import os
 import sys
@@ -27,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from garmin_client import GarminClient
-from garmin_mcp.db import get_connection, init_db, record_fit_parse, save_to_db
+from garmin_mcp.db import get_connection, init_db, save_to_db
 from garmin_mcp.db import query as db_query
 
 
@@ -206,15 +207,12 @@ def _save_trackpoints_from_fit(conn, fit_path: Path) -> tuple[str, int]:
     try:
         activity_id, trackpoints = parse_trackpoints_from_fit_archive(fit_path)
     except Exception:
-        record_fit_parse(conn, fit_path.name, None, "failed", 0)
         return "failed", 0
 
     if activity_id is None or not trackpoints:
-        record_fit_parse(conn, fit_path.name, activity_id, "skipped", 0)
         return "skipped", 0
 
     count = save_to_db(conn, "activity_trackpoints", trackpoints, cal_date=str(activity_id))
-    record_fit_parse(conn, fit_path.name, activity_id, "ingested", count)
     return "ingested", count
 
 
@@ -232,37 +230,6 @@ def _parse_trackpoints_from_fit_dir(conn, fit_dir: Path) -> dict[str, int]:
         return summary
 
     for fit_path in sorted(fit_dir.glob("*.zip")):
-        summary["targeted"] += 1
-        status, count = _save_trackpoints_from_fit(conn, fit_path)
-        if status == "ingested":
-            summary["ingested"] += 1
-            summary["rows"] += count
-        elif status == "skipped":
-            summary["skipped"] += 1
-        else:
-            summary["failed"] += 1
-
-    return summary
-
-
-def _backfill_unparsed_fit(conn, fit_dir: Path) -> dict[str, int]:
-    """Parse FIT archives present on disk but not yet recorded in ``fit_files``.
-
-    Covers files that exist without having been parsed into this database —
-    e.g. after wiping garmin.db but keeping fit/, restoring fit/ from another
-    machine, or an interrupted run. Idempotent: once a file is recorded (even as
-    'skipped' for a GPS-less activity) it is not parsed again.
-    """
-    summary = {"targeted": 0, "ingested": 0, "skipped": 0, "failed": 0, "rows": 0}
-
-    if not fit_dir.exists():
-        return summary
-
-    parsed = {r["filename"] for r in db_query(conn, "SELECT filename FROM fit_files")}
-
-    for fit_path in sorted(fit_dir.glob("*.zip")):
-        if fit_path.name in parsed:
-            continue
         summary["targeted"] += 1
         status, count = _save_trackpoints_from_fit(conn, fit_path)
         if status == "ingested":
@@ -628,117 +595,144 @@ examples:
     print(f"Profile: {profile} — {profile_desc}")
     print(f"Range: {start} to {end}")
 
-    # Open DB connection — stays open for the entire fetch
-    conn = get_connection()
-    init_db(conn)
-
-    # Connect and fetch — data goes directly to SQLite
-    client = GarminClient(
-        email=email,
-        password=password,
-        profile_dir=PROFILE_DIR,
-        headless=not args.visible,
-        session_file=SESSION_FILE,
-    )
+    # Cross-process lock: also respected by garmin-mcp's garmin_sync() tool
+    # (see garmin_mcp/sync.py), which locks the same file. Prevents two
+    # simultaneous browser sessions from writing to the same SQLite file.
+    lock_path = DATA_DIR / ".garmin-sync.lock"
+    lock_file = open(lock_path, "a")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        print("\nAnother sync process holds the lock (e.g. garmin-mcp's garmin_sync() is running). Aborting.")
+        sys.exit(1)
 
     try:
-        if not client.login():
-            print("Login failed!")
-            sys.exit(1)
+        # Open DB connection — stays open for the entire fetch
+        conn = get_connection()
+        init_db(conn)
 
-        fetch_direct_to_db(client, conn, start, end, save_raw=args.save_raw)
-
-        # Report actual row counts from the database (not upsert operations)
-        tables = db_query(
-            conn,
-            "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence' ORDER BY name",
+        # Connect and fetch — data goes directly to SQLite
+        client = GarminClient(
+            email=email,
+            password=password,
+            profile_dir=PROFILE_DIR,
+            headless=not args.visible,
+            session_file=SESSION_FILE,
         )
-        print("\nDatabase contents:")
-        total = 0
-        for t in tables:
-            name = t["name"]
-            row_count = db_query(conn, f"SELECT COUNT(*) as cnt FROM [{name}]")[0]["cnt"]
-            if row_count > 0:
-                print(f"  {name}: {row_count} rows")
-                total += row_count
-        print(f"  Total: {total} rows")
 
-        _log_sync(conn, "garmin_givemydata", total)
+        try:
+            if not client.login():
+                print("Login failed!")
+                sys.exit(1)
 
-        # Download FIT files for activities (unless --no-files)
-        if not args.no_files and profile in ("all", "activities"):
-            fit_dir = DATA_DIR / "fit"
-            fit_dir.mkdir(exist_ok=True)
+            fetch_direct_to_db(client, conn, start, end, save_raw=args.save_raw)
 
-            activities = db_query(
+            # Report actual row counts from the database (not upsert operations)
+            tables = db_query(
                 conn,
-                "SELECT activity_id, activity_name, start_time_local FROM activity WHERE start_time_local IS NOT NULL ORDER BY start_time_local DESC",
+                "SELECT name FROM sqlite_master WHERE type='table' AND name != 'sqlite_sequence' ORDER BY name",
             )
+            print("\nDatabase contents:")
+            total = 0
+            for t in tables:
+                name = t["name"]
+                row_count = db_query(conn, f"SELECT COUNT(*) as cnt FROM [{name}]")[0]["cnt"]
+                if row_count > 0:
+                    print(f"  {name}: {row_count} rows")
+                    total += row_count
+            print(f"  Total: {total} rows")
 
-            # Only download FIT files we don't already have
-            existing_fits = {f.stem.split("_")[1] for f in fit_dir.glob("*.zip")} if fit_dir.exists() else set()
-            new_activities = [
-                (a["activity_id"], a["activity_name"], a["start_time_local"])
-                for a in activities
-                if str(a["activity_id"]) not in existing_fits
-            ]
+            _log_sync(conn, "garmin_givemydata", total)
 
-            if new_activities:
-                print(
-                    f"\nDownloading FIT files ({len(new_activities)} new, {len(existing_fits)} already downloaded)..."
+            # Download FIT files for activities (unless --no-files)
+            if not args.no_files and profile in ("all", "activities"):
+                fit_dir = DATA_DIR / "fit"
+                fit_dir.mkdir(exist_ok=True)
+
+                activities = db_query(
+                    conn,
+                    "SELECT activity_id, activity_name, start_time_local FROM activity WHERE start_time_local IS NOT NULL ORDER BY start_time_local DESC",
                 )
 
-                downloaded = 0
-                for i, (aid, name, date_str) in enumerate(new_activities):
-                    safe_name = ""
-                    if name:
-                        safe_name = "_" + "".join(c if c.isalnum() or c in "-_ " else "" for c in name).strip().replace(
-                            " ", "_"
-                        )
-                    safe_date = date_str[:10] if date_str else str(aid)
-                    filename = f"{safe_date}_{aid}{safe_name}.zip"
-                    filepath = fit_dir / filename
+                # Only download FIT files we don't already have
+                existing_fits = {f.stem.split("_")[1] for f in fit_dir.glob("*.zip")} if fit_dir.exists() else set()
+                new_activities = [
+                    (a["activity_id"], a["activity_name"], a["start_time_local"])
+                    for a in activities
+                    if str(a["activity_id"]) not in existing_fits
+                ]
 
-                    api_path = f"/gc-api/download-service/files/activity/{aid}"
-                    data = client.download_file(api_path)
+                if new_activities:
+                    print(
+                        f"\nDownloading FIT files ({len(new_activities)} new, {len(existing_fits)} already downloaded)..."
+                    )
 
-                    if data:
-                        with open(filepath, "wb") as f:
-                            f.write(data)
-                        downloaded += 1
+                    downloaded = 0
+                    trackpoint_summary = {
+                        "targeted": 0,
+                        "ingested": 0,
+                        "skipped": 0,
+                        "failed": 0,
+                        "rows": 0,
+                    }
+                    for i, (aid, name, date_str) in enumerate(new_activities):
+                        safe_name = ""
+                        if name:
+                            safe_name = "_" + "".join(
+                                c if c.isalnum() or c in "-_ " else "" for c in name
+                            ).strip().replace(" ", "_")
+                        safe_date = date_str[:10] if date_str else str(aid)
+                        filename = f"{safe_date}_{aid}{safe_name}.zip"
+                        filepath = fit_dir / filename
 
-                    if downloaded > 0 and downloaded % 10 == 0:
-                        print(f"  {downloaded}/{len(new_activities)} downloaded...")
+                        api_path = f"/gc-api/download-service/files/activity/{aid}"
+                        data = client.download_file(api_path)
 
-                    if i % 20 == 19:
-                        time.sleep(1)
+                        if data:
+                            with open(filepath, "wb") as f:
+                                f.write(data)
+                            downloaded += 1
+                            if args.parse_trackpoints:
+                                trackpoint_summary["targeted"] += 1
+                                status, count = _save_trackpoints_from_fit(conn, filepath)
+                                if status == "ingested":
+                                    trackpoint_summary["ingested"] += 1
+                                    trackpoint_summary["rows"] += count
+                                elif status == "skipped":
+                                    trackpoint_summary["skipped"] += 1
+                                else:
+                                    trackpoint_summary["failed"] += 1
 
-                print(f"  FIT files: {downloaded} downloaded to {fit_dir}/")
-            else:
-                print(f"\nFIT files: all {len(existing_fits)} already downloaded")
+                        if downloaded > 0 and downloaded % 10 == 0:
+                            print(f"  {downloaded}/{len(new_activities)} downloaded...")
 
-            # Parse trackpoints for every FIT on disk not yet recorded in the
-            # database — covers freshly downloaded files and any kept from a
-            # previous database (e.g. a wipe + resync that retained fit/).
-            if args.parse_trackpoints:
-                summary = _backfill_unparsed_fit(conn, fit_dir)
-                if summary["targeted"]:
-                    _print_trackpoint_summary(summary, prefix="  ")
+                        if i % 20 == 19:
+                            time.sleep(1)
 
+                    print(f"  FIT files: {downloaded} downloaded to {fit_dir}/")
+                    if args.parse_trackpoints and trackpoint_summary["targeted"]:
+                        _print_trackpoint_summary(trackpoint_summary, prefix="  ")
+                else:
+                    print(f"\nFIT files: all {len(existing_fits)} already downloaded")
+
+        finally:
+            client.close()
+            conn.close()
+
+        # Final status
+        final = get_db_status()
+        fit_dir = DATA_DIR / "fit"
+        fit_count = len(list(fit_dir.glob("*.zip"))) if fit_dir.exists() else 0
+
+        print("\nDatabase status:")
+        print(f"  Daily summaries: {final['rows']} days")
+        print(f"  Date range: {final.get('first_date', '?')} to {final.get('last_date', '?')}")
+        print(f"  FIT files: {fit_count}")
+        print(f"  Location: {DATA_DIR / 'garmin.db'}")
     finally:
-        client.close()
-        conn.close()
-
-    # Final status
-    final = get_db_status()
-    fit_dir = DATA_DIR / "fit"
-    fit_count = len(list(fit_dir.glob("*.zip"))) if fit_dir.exists() else 0
-
-    print("\nDatabase status:")
-    print(f"  Daily summaries: {final['rows']} days")
-    print(f"  Date range: {final.get('first_date', '?')} to {final.get('last_date', '?')}")
-    print(f"  FIT files: {fit_count}")
-    print(f"  Location: {DATA_DIR / 'garmin.db'}")
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ directly to SQLite via save_to_db().
 
 import logging
 import os
+import fcntl
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -118,82 +119,103 @@ def incremental_sync(
             "message": "Credentials not found. Run ./setup.sh or set GARMIN_EMAIL and GARMIN_PASSWORD.",
         }
 
-    # Open DB connection for direct writes
-    conn = get_connection()
-    init_db(conn)
-
-    # Build set of already-fetched activity IDs so fetch_all() skips them
-    existing = conn.execute("SELECT DISTINCT activity_id FROM activity_splits").fetchall()
-    known_activity_ids = {row[0] for row in existing}
-    if known_activity_ids:
-        logger.info("Skipping %d activities with existing details", len(known_activity_ids))
-
-    counts = {}
-
-    def on_batch(endpoint_name, data, cal_date=None):
-        n = save_to_db(conn, endpoint_name, data, cal_date=cal_date)
-        if n > 0:
-            counts[endpoint_name] = counts.get(endpoint_name, 0) + n
-        # Track newly fetched activity details so later requests skip them
-        if endpoint_name == "activity_splits" and cal_date:
-            try:
-                known_activity_ids.add(int(cal_date))
-            except (ValueError, TypeError):
-                pass
-
-    SESSION_FILE = PROJECT_DIR / "garmin_session.json"
-    client = GarminClient(
-        email=email,
-        password=password,
-        profile_dir=PROFILE_DIR,
-        headless=True,
-        session_file=SESSION_FILE,
-    )
-
-    sync_label = "backfill" if is_backfill else "incremental sync"
-    logger.info("Starting %s for %s (from %s)", sync_label, today, effective_start)
+    # Cross-process lock: also respected by any external scheduler (cron,
+    # systemd timer, or a container entrypoint) invoking `garmin-givemydata`
+    # directly against the same data directory. Prevents two simultaneous
+    # browser sessions from writing to the same SQLite file at once.
+    # See issue: MCP garmin_sync() and an externally-scheduled CLI sync can
+    # race with no coordination between them.
+    lock_path = Path(DB_PATH).parent / ".garmin-sync.lock"
+    lock_file = open(lock_path, "a")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return {
+            "status": "blocked",
+            "message": "Another sync process holds the lock (e.g. a scheduled sync already running). Try again shortly.",
+        }
 
     try:
-        if not client.login():
-            return {"status": "error", "message": "Login failed"}
+        # Open DB connection for direct writes
+        conn = get_connection()
+        init_db(conn)
 
-        client.fetch_all(
-            target_date=today,
-            start_date=effective_start,
-            end_date=today,
-            on_batch=on_batch,
-            known_activity_ids=known_activity_ids,
-            save_raw=save_raw,
+        # Build set of already-fetched activity IDs so fetch_all() skips them
+        existing = conn.execute("SELECT DISTINCT activity_id FROM activity_splits").fetchall()
+        known_activity_ids = {row[0] for row in existing}
+        if known_activity_ids:
+            logger.info("Skipping %d activities with existing details", len(known_activity_ids))
+
+        counts = {}
+
+        def on_batch(endpoint_name, data, cal_date=None):
+            n = save_to_db(conn, endpoint_name, data, cal_date=cal_date)
+            if n > 0:
+                counts[endpoint_name] = counts.get(endpoint_name, 0) + n
+            # Track newly fetched activity details so later requests skip them
+            if endpoint_name == "activity_splits" and cal_date:
+                try:
+                    known_activity_ids.add(int(cal_date))
+                except (ValueError, TypeError):
+                    pass
+
+        SESSION_FILE = PROJECT_DIR / "garmin_session.json"
+        client = GarminClient(
+            email=email,
+            password=password,
+            profile_dir=PROFILE_DIR,
+            headless=True,
+            session_file=SESSION_FILE,
         )
 
-        # Parse trackpoints from local FIT files when explicitly requested.
-        if parse_trackpoints:
-            trackpoint_count = _parse_trackpoints_for_activities(conn, known_activity_ids)
-            if trackpoint_count > 0:
-                counts["activity_trackpoints"] = trackpoint_count
+        sync_label = "backfill" if is_backfill else "incremental sync"
+        logger.info("Starting %s for %s (from %s)", sync_label, today, effective_start)
 
+        try:
+            if not client.login():
+                return {"status": "error", "message": "Login failed"}
+
+            client.fetch_all(
+                target_date=today,
+                start_date=effective_start,
+                end_date=today,
+                on_batch=on_batch,
+                known_activity_ids=known_activity_ids,
+                save_raw=save_raw,
+            )
+
+            # Parse trackpoints from local FIT files when explicitly requested.
+            if parse_trackpoints:
+                trackpoint_count = _parse_trackpoints_for_activities(conn, known_activity_ids)
+                if trackpoint_count > 0:
+                    counts["activity_trackpoints"] = trackpoint_count
+
+        finally:
+            client.close()
+
+        # Log the sync
+        sync_ts = datetime.now(timezone.utc).isoformat()
+        total = sum(counts.values())
+        conn.execute(
+            "INSERT INTO sync_log (sync_date, sync_type, records_upserted, status) VALUES (?, ?, ?, ?)",
+            (sync_ts, "backfill" if is_backfill else "incremental_sync", total, "ok"),
+        )
+        conn.commit()
+        conn.close()
+
+        logger.info("%s complete. Total records upserted: %d", sync_label.capitalize(), total)
+
+        return {
+            "status": "ok",
+            "target_date": today,
+            "start_date": effective_start,
+            "records": counts,
+            "total_upserted": total,
+        }
     finally:
-        client.close()
-
-    # Log the sync
-    sync_ts = datetime.now(timezone.utc).isoformat()
-    total = sum(counts.values())
-    conn.execute(
-        "INSERT INTO sync_log (sync_date, sync_type, records_upserted, status) VALUES (?, ?, ?, ?)",
-        (sync_ts, "backfill" if is_backfill else "incremental_sync", total, "ok"),
-    )
-    conn.commit()
-    conn.close()
-
-    logger.info("%s complete. Total records upserted: %d", sync_label.capitalize(), total)
-
-    return {
-        "status": "ok",
-        "target_date": today,
-        "start_date": effective_start,
-        "records": counts,
-        "total_upserted": total,
-    }
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 # ---------------------------------------------------------------------------

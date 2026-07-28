@@ -4,6 +4,7 @@ Garmin MCP server — exposes health and activity data via FastMCP tools.
 
 import json
 import logging
+import os
 import threading
 from datetime import date, timedelta
 
@@ -13,7 +14,16 @@ from .db import get_connection, init_db, query, query_readonly
 
 log = logging.getLogger(__name__)
 
-mcp = FastMCP("garmin")
+# Transport configuration, overridable via environment variables. This lets
+# garmin-mcp run as a persistent network service (e.g. `streamable-http` on
+# a LAN host, so multiple client machines can query one shared database)
+# without any code changes for the default single-machine stdio use case.
+# Defaults reproduce the previous, hardcoded behaviour exactly -- existing
+# stdio users see zero change unless they explicitly set these.
+_MCP_HOST = os.environ.get("GARMIN_MCP_HOST", "127.0.0.1")
+_MCP_PORT = int(os.environ.get("GARMIN_MCP_PORT", "8000"))
+
+mcp = FastMCP("garmin", host=_MCP_HOST, port=_MCP_PORT)
 
 # Ensure all tables exist on startup
 _conn = get_connection()
@@ -2873,4 +2883,7 @@ def garmin_wellness_activity(days: int = 30) -> str:
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    # GARMIN_MCP_TRANSPORT: "stdio" (default, unchanged behaviour), or any
+    # transport FastMCP supports ("streamable-http", "sse") for network use.
+    transport = os.environ.get("GARMIN_MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
