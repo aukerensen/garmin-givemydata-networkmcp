@@ -8,7 +8,10 @@ import os
 import threading
 from datetime import date, timedelta
 
-from mcp.server.fastmcp import FastMCP
+try:  # mcp SDK v1
+    from mcp.server.fastmcp import FastMCP
+except ImportError:  # mcp SDK v2 renamed FastMCP to MCPServer
+    from mcp.server import MCPServer as FastMCP
 
 from .db import get_connection, init_db, query, query_readonly
 
@@ -35,28 +38,163 @@ _conn.close()
 # garmin_schema
 # ---------------------------------------------------------------------------
 
+# The intraday samples live inside raw_json, and Garmin is not consistent about
+# them: some feeds timestamp each sample as epoch milliseconds (GMT), others as
+# local ISO text.  Reading one like the other produces plausible garbage instead
+# of an error, so the shape is read back from a stored row rather than kept in a
+# list here that would silently go stale when the upstream format changes.
+_TS_EPOCH_MS = "epoch_ms"
+_TS_ISO_LOCAL = "iso_local"
+
+# What the non-timestamp positions of each tuple mean — the one thing that
+# cannot be inferred from the data itself.  Applied in order, timestamps skipped.
+_RAW_JSON_FIELDS = {
+    "$.bodyBattery.data": ["level", "?", "status"],
+    "$.bodyBatteryValuesArray": ["level", "?", "status"],
+    "$.floorValuesArray": ["ascended", "descended"],
+    "$.heartRateValues": ["bpm"],
+    "$.movementValues": ["intensity"],
+    "$.respirationValuesArray": ["breaths_per_min"],
+    "$.spo2ValuesArray": ["spo2", "?"],
+    "$.stress.data": ["stress"],
+    "$.stressValuesArray": ["stress"],
+}
+
+_EPOCH_MS_HINT = (
+    "epoch_ms is GMT: use datetime(ts/1000,'unixepoch') and add your UTC offset "
+    "in seconds for local time. iso_local is already local text — never mix the two."
+)
+
+# Sentinels that look like readings but are not; averaging over them skews the
+# result.  Detecting these would mean scanning every row, so they stay declared.
+_RAW_JSON_SENTINELS = {
+    "stress": "stress < 0 means no reading (-1 unmeasurable, -2 off-wrist); filter them out",
+    "respiration": "value < 0 means no reading (-1 unmeasurable, -2 off-wrist); filter them out",
+}
+
+# How many samples to look through for a non-null value per tuple position: the
+# first sample of a night often carries nulls where later ones carry readings.
+_SHAPE_SAMPLE_SIZE = 20
+
+
+def _classify(value):
+    """Name a tuple position by what it holds, timestamps first."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)) and value > 1e11:  # ms since epoch, not a reading
+        return _TS_EPOCH_MS
+    if isinstance(value, str) and value[:2] == "20":
+        return _TS_ISO_LOCAL
+    return type(value).__name__
+
+
+def _describe_raw_json(conn, table):
+    """Read the shape of *table*'s intraday arrays back from a stored row."""
+    cols = [c["name"] for c in query(conn, f"PRAGMA table_info([{table}])")]
+    if "raw_json" not in cols:
+        return {}
+    rows = query(conn, f"SELECT raw_json FROM [{table}] WHERE raw_json IS NOT NULL LIMIT 1")
+    if not rows:
+        return {}
+    try:
+        payload = json.loads(rows[0]["raw_json"])
+    except (TypeError, ValueError):
+        return {}
+
+    shapes = {}
+
+    def visit(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                visit(value, f"{path}.{key}")
+            return
+        if not isinstance(node, list) or len(node) <= 5:
+            return
+        head = node[0]
+        if isinstance(head, dict):
+            shapes[f"$.{path.lstrip('.')}"] = "{" + ", ".join(sorted(head)) + "}"
+        elif isinstance(head, list) and head:
+            shapes[f"$.{path.lstrip('.')}"] = _describe_tuple(node, f"$.{path.lstrip('.')}")
+
+    visit(payload, "")
+    return shapes
+
+
+def _describe_tuple(samples, path):
+    """Label each position of a [ts, value, ...] tuple."""
+    kinds = []
+    for i in range(len(samples[0])):
+        # A position may be null in the first sample but hold a reading later on.
+        kind = next(
+            (k for k in (_classify(s[i]) for s in samples[:_SHAPE_SAMPLE_SIZE] if i < len(s)) if k),
+            "null",
+        )
+        kinds.append(kind)
+
+    labels = list(_RAW_JSON_FIELDS.get(path, []))
+    described = []
+    for kind in kinds:
+        if kind in (_TS_EPOCH_MS, _TS_ISO_LOCAL):
+            described.append(kind)
+        else:
+            described.append(labels.pop(0) if labels else kind)
+    return "[" + ", ".join(described) + "]"
+
 
 @mcp.tool()
-def garmin_schema() -> str:
-    """Show all tables, their columns, and row counts."""
+def garmin_schema(tables: str = "") -> str:
+    """Show table columns and row counts.
+
+    Called without *tables*, returns a compact index: row count per non-empty
+    table, plus the names of the empty ones — no column lists.  Pass a
+    comma-separated list of table names (e.g. "sleep,stress") to get the
+    columns of just those tables.
+    """
     conn = get_connection()
     try:
-        tables = query(
-            conn,
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-        )
-        result = {}
-        for t in tables:
-            table_name = t["name"]
-            if not table_name.isidentifier():
-                continue
-            cols = query(conn, f"PRAGMA table_info([{table_name}])")
-            row_count = query(conn, f"SELECT COUNT(*) AS cnt FROM [{table_name}]")[0]["cnt"]
-            result[table_name] = {
+        names = [
+            t["name"]
+            for t in query(conn, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            if t["name"].isidentifier()
+        ]
+        wanted = [t.strip() for t in tables.split(",") if t.strip()]
+
+        if not wanted:
+            counts = {n: query(conn, f"SELECT COUNT(*) AS cnt FROM [{n}]")[0]["cnt"] for n in names}
+            return json.dumps(
+                {
+                    "tables": {n: c for n, c in counts.items() if c},
+                    "empty_tables": [n for n, c in counts.items() if not c],
+                    "hint": 'call garmin_schema("sleep,stress") for the columns of specific tables',
+                },
+                separators=(",", ":"),
+            )
+
+        unknown = [t for t in wanted if t not in names]
+        if unknown:
+            return json.dumps({"error": "unknown tables", "unknown": unknown, "available": names})
+
+        # Tables live under their own key so a note can never be mistaken for
+        # a table (nor a table named "timestamps" shadow a note).
+        result = {"tables": {}}
+        for name in wanted:
+            cols = query(conn, f"PRAGMA table_info([{name}])")
+            result["tables"][name] = {
                 "columns": [c["name"] for c in cols],
-                "row_count": row_count,
+                "row_count": query(conn, f"SELECT COUNT(*) AS cnt FROM [{name}]")[0]["cnt"],
             }
-        return json.dumps(result, indent=2)
+            shapes = _describe_raw_json(conn, name)
+            if shapes:
+                result["tables"][name]["raw_json"] = shapes
+            if name in _RAW_JSON_SENTINELS:
+                result["tables"][name]["caveat"] = _RAW_JSON_SENTINELS[name]
+
+        if any(
+            _TS_EPOCH_MS in shape for table in result["tables"].values() for shape in table.get("raw_json", {}).values()
+        ):
+            result["timestamps"] = _EPOCH_MS_HINT
+
+        return json.dumps(result, separators=(",", ":"))
     finally:
         conn.close()
 
@@ -77,7 +215,7 @@ def garmin_query(sql: str, limit: int = 1000) -> str:
     try:
         clamped = max(1, min(limit, 10000))
         rows = query_readonly(sql, limit=clamped)
-        return json.dumps(rows, indent=2, default=str)
+        return json.dumps(rows, separators=(",", ":"), default=str)
     except Exception as exc:
         log.exception("garmin_query failed")
         return json.dumps({"error": "Query failed. Check that your SQL is a valid SELECT statement."})
@@ -202,7 +340,7 @@ def garmin_health_summary(start_date: str = "", end_date: str = "", days: int = 
             "hill_score": hill_rows[0] if hill_rows else {},
             "race_predictions": race_rows[0] if race_rows else {},
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -262,7 +400,7 @@ def garmin_activities(
     conn = get_connection()
     try:
         rows = query(conn, sql, params)
-        return json.dumps(rows, indent=2, default=str)
+        return json.dumps(rows, separators=(",", ":"), default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
     finally:
@@ -415,7 +553,7 @@ def garmin_trends(metric: str, period: str = "month") -> str:
     conn = get_connection()
     try:
         rows = query(conn, sql)
-        return json.dumps({"metric": metric, "period": period, "data": rows}, indent=2, default=str)
+        return json.dumps({"metric": metric, "period": period, "data": rows}, separators=(",", ":"), default=str)
     except Exception as exc:
         return json.dumps({"error": str(exc)})
     finally:
@@ -593,10 +731,10 @@ def garmin_sync(refresh: bool = True) -> str:
     if not refresh:
         if status["is_stale"] and not _sync_state["running"]:
             status["hint"] = "Data is not current. Call garmin_sync() to refresh."
-        return json.dumps(status, indent=2, default=str)
+        return json.dumps(status, separators=(",", ":"), default=str)
 
     status["sync"] = _start_background_sync()
-    return json.dumps(status, indent=2, default=str)
+    return json.dumps(status, separators=(",", ":"), default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -697,7 +835,7 @@ def garmin_today() -> str:
             "fitness_age": fitness[0] if fitness else {},
             "last_activity": last_activity[0] if last_activity else {},
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -830,7 +968,7 @@ def garmin_activity_detail(activity_id: int = 0, last: bool = False) -> str:
             else [],
             "running_dynamics": dynamics[0] if dynamics else {},
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -870,7 +1008,7 @@ def garmin_activity_trackpoints(activity_id: int, limit: int = 500, offset: int 
                     "'garmin-givemydata --rebuild-trackpoints' to backfill from FIT files, "
                     "or 'garmin-givemydata' (which now parses trackpoints by default).",
                 },
-                indent=2,
+                separators=(",", ":"),
             )
 
         points = query(
@@ -892,7 +1030,7 @@ def garmin_activity_trackpoints(activity_id: int, limit: int = 500, offset: int 
                 "offset": offset,
                 "trackpoints": points,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -954,7 +1092,9 @@ def garmin_sleep(start_date: str = "", days: int = 7) -> str:
                ORDER BY calendar_date""",
             [start_date, end_date],
         )
-        return json.dumps({"period": {"start": start_date, "end": end_date}, "nights": rows}, indent=2, default=str)
+        return json.dumps(
+            {"period": {"start": start_date, "end": end_date}, "nights": rows}, separators=(",", ":"), default=str
+        )
     finally:
         conn.close()
 
@@ -1077,7 +1217,7 @@ def garmin_training_load() -> str:
             "weekly_volume_12w": weekly,
             "load_by_sport": by_sport,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1172,7 +1312,7 @@ def garmin_compare(
                 pct = round((diff / v1) * 100, 1) if v1 != 0 else None
                 deltas[key] = {"period1": v1, "period2": v2, "delta": diff, "pct_change": pct}
 
-        return json.dumps({"period1": p1, "period2": p2, "changes": deltas}, indent=2, default=str)
+        return json.dumps({"period1": p1, "period2": p2, "changes": deltas}, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1228,7 +1368,7 @@ def garmin_records() -> str:
             code = str(r.get("pr_type", ""))
             r["record_name"] = pr_names.get(code, f"Type {code}")
 
-        return json.dumps(rows, indent=2, default=str)
+        return json.dumps(rows, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1283,7 +1423,7 @@ def garmin_fitness_age(period: str = "month") -> str:
             },
             "timeline": rows,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1362,7 +1502,7 @@ def garmin_hrv(days: int = 30) -> str:
             "trend": {"direction": trend, "pct_change_7d": trend_pct},
             "daily": rows,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1423,7 +1563,7 @@ def garmin_body_battery(days: int = 14) -> str:
             },
             "daily": rows,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1472,7 +1612,7 @@ def garmin_stress(days: int = 14) -> str:
             },
             "daily": rows,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1553,7 +1693,7 @@ def garmin_heart_rate(days: int = 30) -> str:
             },
             "daily": output,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1606,7 +1746,7 @@ def garmin_spo2(days: int = 14) -> str:
             },
             "daily": rows,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1646,7 +1786,7 @@ def garmin_body_composition() -> str:
             "total_entries": len(rows),
             "history": rows,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1667,7 +1807,7 @@ def garmin_devices() -> str:
                       last_sync, software_version, battery_status, battery_voltage
                FROM device ORDER BY last_sync DESC""",
         )
-        return json.dumps(rows, indent=2, default=str)
+        return json.dumps(rows, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1741,7 +1881,7 @@ def garmin_week_summary() -> str:
             "activities_this_week": activities,
             "daily": days,
         }
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -1838,7 +1978,7 @@ def garmin_recovery(days_after: int = 3) -> str:
                 "recovery_by_sport": sport_summary,
                 "sessions": results,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -1894,7 +2034,7 @@ def garmin_training_status(days: int = 90) -> str:
                 "transitions": transitions[-10:],
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -1941,7 +2081,7 @@ def garmin_workouts() -> str:
                 "scheduled": schedule,
                 "training_plans": plans,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -1983,7 +2123,7 @@ def garmin_badges() -> str:
                 "badges": rows,
                 "by_category": {k: len(v) for k, v in by_category.items()},
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2029,7 +2169,7 @@ def garmin_hydration(days: int = 30) -> str:
                 "data": rows if tracked else [],
                 "note": "No hydration data logged" if not tracked else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2074,7 +2214,7 @@ def garmin_respiration(days: int = 14) -> str:
                 },
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2116,7 +2256,7 @@ def garmin_intensity_minutes(days: int = 30) -> str:
                 "who_target": "150 min/week (moderate) or 75 min/week (vigorous)",
                 "weekly": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2161,7 +2301,7 @@ def garmin_floors(days: int = 14) -> str:
                 },
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2222,7 +2362,7 @@ def garmin_steps(days: int = 14) -> str:
                 },
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2279,7 +2419,7 @@ def garmin_calories(days: int = 14) -> str:
                 "daily": rows,
                 "food_log": consumed if consumed else [],
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2321,7 +2461,7 @@ def garmin_blood_pressure(days: int = 90) -> str:
                 "data": rows,
                 "note": "No blood pressure data recorded" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2349,7 +2489,7 @@ def garmin_goals() -> str:
                 "goals": rows,
                 "note": "No goals set" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2377,7 +2517,7 @@ def garmin_challenges() -> str:
                 "challenges": rows,
                 "note": "No challenges found" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2401,7 +2541,7 @@ def garmin_user_profile() -> str:
                 result[r["key"]] = json.loads(r["raw_json"]) if r["raw_json"] else None
             except (json.JSONDecodeError, TypeError):
                 result[r["key"]] = r["raw_json"]
-        return json.dumps(result, indent=2, default=str)
+        return json.dumps(result, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -2468,7 +2608,7 @@ def garmin_race_predictions(days: int = 30) -> str:
                 "trend": {"direction": trend, "5k_delta_sec": round(delta)},
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2510,7 +2650,7 @@ def garmin_endurance_score(days: int = 30) -> str:
                 "trend": trend,
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2543,7 +2683,7 @@ def garmin_hill_score(days: int = 30) -> str:
                 "latest": rows[-1] if rows else {},
                 "daily": rows,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2589,7 +2729,7 @@ def garmin_vo2max() -> str:
                 "from_activities": vo2_activities,
                 "note": "No VO2max data" if not vo2_table and not vo2_activities else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2640,7 +2780,7 @@ def garmin_health_snapshot() -> str:
                 "snapshots": parsed,
                 "note": "No health snapshots taken" if not parsed else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2671,7 +2811,7 @@ def garmin_gear() -> str:
                 "gear": rows,
                 "note": "No gear tracked" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2718,7 +2858,7 @@ def garmin_daily_events(days: int = 7) -> str:
                     entry["events"] = r["raw_json"]
             parsed.append(entry)
 
-        return json.dumps(parsed, indent=2, default=str)
+        return json.dumps(parsed, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -2739,7 +2879,7 @@ def garmin_activity_types() -> str:
                FROM activity_types
                ORDER BY type_key""",
         )
-        return json.dumps(rows, indent=2, default=str)
+        return json.dumps(rows, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -2764,7 +2904,7 @@ def garmin_hr_zones() -> str:
                 except (json.JSONDecodeError, TypeError):
                     entry["zones"] = r["raw_json"]
             parsed.append(entry)
-        return json.dumps(parsed, indent=2, default=str)
+        return json.dumps(parsed, separators=(",", ":"), default=str)
     finally:
         conn.close()
 
@@ -2799,7 +2939,7 @@ def garmin_load_focus(days: int = 28) -> str:
                 "daily": rows,
                 "note": "No load focus data" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2833,7 +2973,7 @@ def garmin_lactate_threshold() -> str:
                 "history": rows,
                 "note": "No lactate threshold data" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
@@ -2870,7 +3010,7 @@ def garmin_wellness_activity(days: int = 30) -> str:
                 "sessions": rows,
                 "note": "No wellness activity data" if not rows else None,
             },
-            indent=2,
+            separators=(",", ":"),
             default=str,
         )
     finally:
