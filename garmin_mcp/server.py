@@ -10,8 +10,12 @@ from datetime import date, timedelta
 
 try:  # mcp SDK v1
     from mcp.server.fastmcp import FastMCP
+
+    _MCP_V2 = False
 except ImportError:  # mcp SDK v2 renamed FastMCP to MCPServer
     from mcp.server import MCPServer as FastMCP
+
+    _MCP_V2 = True
 
 from .db import get_connection, init_db, query, query_readonly
 
@@ -26,7 +30,9 @@ log = logging.getLogger(__name__)
 _MCP_HOST = os.environ.get("GARMIN_MCP_HOST", "127.0.0.1")
 _MCP_PORT = int(os.environ.get("GARMIN_MCP_PORT", "8000"))
 
-mcp = FastMCP("garmin", host=_MCP_HOST, port=_MCP_PORT)
+# SDK v1 takes host/port in the FastMCP constructor; SDK v2 (MCPServer) dropped
+# them there and takes them as keyword arguments of run() instead.
+mcp = FastMCP("garmin") if _MCP_V2 else FastMCP("garmin", host=_MCP_HOST, port=_MCP_PORT)
 
 # Ensure all tables exist on startup
 _conn = get_connection()
@@ -3026,4 +3032,7 @@ def main() -> None:
     # GARMIN_MCP_TRANSPORT: "stdio" (default, unchanged behaviour), or any
     # transport FastMCP supports ("streamable-http", "sse") for network use.
     transport = os.environ.get("GARMIN_MCP_TRANSPORT", "stdio")
-    mcp.run(transport=transport)
+    if _MCP_V2 and transport in ("streamable-http", "sse"):
+        mcp.run(transport=transport, host=_MCP_HOST, port=_MCP_PORT)
+    else:
+        mcp.run(transport=transport)
