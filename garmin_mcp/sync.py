@@ -5,9 +5,9 @@ Fetches today's and yesterday's data from Garmin Connect and saves it
 directly to SQLite via save_to_db().
 """
 
+import fcntl
 import logging
 import os
-import fcntl
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
