@@ -41,9 +41,24 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _busy_timeout() -> float:
+    """Seconds to wait for a lock held by another writer (e.g. a running sync).
+
+    sqlite3's default of 5 s is too short when the MCP server and a sync start
+    at the same time: init_db() needs the write lock and the sync can hold it
+    for longer. Overridable via GARMIN_DB_BUSY_TIMEOUT.
+    """
+    import os
+
+    try:
+        return float(os.environ.get("GARMIN_DB_BUSY_TIMEOUT", "60"))
+    except ValueError:
+        return 60.0
+
+
 def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     """Return a sqlite3 connection with WAL mode and Row factory enabled."""
-    conn = sqlite3.connect(db_path or DB_PATH)
+    conn = sqlite3.connect(db_path or DB_PATH, timeout=_busy_timeout())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

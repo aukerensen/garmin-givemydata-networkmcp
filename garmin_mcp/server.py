@@ -5,7 +5,9 @@ Garmin MCP server — exposes health and activity data via FastMCP tools.
 import json
 import logging
 import os
+import sqlite3
 import threading
+import time
 from datetime import date, timedelta
 
 try:  # mcp SDK v1
@@ -34,10 +36,39 @@ _MCP_PORT = int(os.environ.get("GARMIN_MCP_PORT", "8000"))
 # them there and takes them as keyword arguments of run() instead.
 mcp = FastMCP("garmin") if _MCP_V2 else FastMCP("garmin", host=_MCP_HOST, port=_MCP_PORT)
 
+def _init_db_with_retry(max_wait: float | None = None, retry_delay: float = 15.0, sleep=time.sleep) -> None:
+    """Run init_db() at startup, waiting for a lock held by another writer.
+
+    init_db() always needs the write lock (its idempotent backfills issue
+    UPDATE statements even when nothing matches). When the server starts
+    while a sync is writing, a single attempt fails with "database is locked"
+    and the server never starts. Retry until max_wait seconds have passed
+    (GARMIN_MCP_INIT_MAX_WAIT, default 600), then re-raise.
+    """
+    if max_wait is None:
+        try:
+            max_wait = float(os.environ.get("GARMIN_MCP_INIT_MAX_WAIT", "600"))
+        except ValueError:
+            max_wait = 600.0
+    deadline = time.monotonic() + max_wait
+    attempt = 0
+    while True:
+        attempt += 1
+        conn = get_connection()
+        try:
+            init_db(conn)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or time.monotonic() + retry_delay > deadline:
+                raise
+            log.warning("init_db: database is locked (attempt %d), retrying in %.0f s", attempt, retry_delay)
+        finally:
+            conn.close()
+        sleep(retry_delay)
+
+
 # Ensure all tables exist on startup
-_conn = get_connection()
-init_db(_conn)
-_conn.close()
+_init_db_with_retry()
 
 
 # ---------------------------------------------------------------------------
