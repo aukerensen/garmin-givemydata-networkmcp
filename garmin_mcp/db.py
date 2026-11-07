@@ -65,6 +65,57 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     return conn
 
 
+# Default size of the rolling window whose activity details are re-fetched every
+# sync, so edits made in Garmin Connect after an activity first synced (e.g. the
+# self-evaluation feel/RPE, which only appear in the details payload) are picked
+# up. See #85 finding 4. 0 disables the re-fetch.
+DEFAULT_REFETCH_RECENT_DAYS = 7
+
+
+def recent_activity_ids(conn: sqlite3.Connection, today: str, days: int) -> set:
+    """activity_ids whose start is within ``days`` of ``today``.
+
+    These are excluded from the "already has details, skip it" set so their
+    details are re-fetched each sync and late edits land. Returns an empty set
+    when days <= 0 (re-fetch disabled).
+    """
+    if not days or days <= 0:
+        return set()
+    from datetime import date, timedelta
+
+    try:
+        cutoff = (date.fromisoformat(today) - timedelta(days=days)).isoformat()
+    except (TypeError, ValueError):
+        return set()
+    rows = conn.execute(
+        "SELECT activity_id FROM activity WHERE start_time_local IS NOT NULL AND start_time_local >= ?",
+        (cutoff,),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def widen_start_for_refetch(start: str, today: str, days: int) -> str:
+    """Widen an auto-computed fetch start to cover the re-fetch window.
+
+    Returns the earlier of ``start`` and ``today - days`` (both YYYY-MM-DD), so a
+    recently-edited activity appears in the fetched list and its details refresh
+    (#85 finding 4). Returns ``start`` unchanged when days <= 0 or dates are
+    unparseable. Callers pass this only on the auto/incremental path — an
+    explicit start date is respected by not calling it.
+    """
+    if not days or days <= 0:
+        return start
+    from datetime import date, timedelta
+
+    try:
+        window_start = (date.fromisoformat(today) - timedelta(days=days)).isoformat()
+    except (TypeError, ValueError):
+        return start
+    if not start:
+        return window_start
+    return min(start, window_start)
+
+
 # ---------------------------------------------------------------------------
 # Schema — 35 tables
 # ---------------------------------------------------------------------------
@@ -178,6 +229,36 @@ CREATE TABLE IF NOT EXISTS spo2 (
     events_below_threshold          INTEGER,
     duration_below_threshold_secs   REAL,
     raw_json                        TEXT
+);
+
+-- On-demand / daytime SpO2 spot checks from wellness/daily/spo2 (#86). These
+-- individual readings (and the hourly averages below) are not in the dailySpo2
+-- sleep array the `spo2` table is built from.
+CREATE TABLE IF NOT EXISTS spo2_spot_reading (
+    calendar_date       TEXT NOT NULL,
+    reading_timestamp   INTEGER NOT NULL,
+    spo2                INTEGER,
+    plottable           INTEGER,
+    PRIMARY KEY (calendar_date, reading_timestamp)
+);
+
+CREATE TABLE IF NOT EXISTS spo2_hourly_average (
+    calendar_date   TEXT NOT NULL,
+    hour_timestamp  INTEGER NOT NULL,
+    avg_spo2        INTEGER,
+    PRIMARY KEY (calendar_date, hour_timestamp)
+);
+
+-- Per-second Health Snapshot graphs (#86), parsed from the wellness _ACTIVITY.fit.
+-- Keyed to the snapshot via health_snapshot.snapshot_id.
+CREATE TABLE IF NOT EXISTS health_snapshot_reading (
+    snapshot_id    TEXT NOT NULL,
+    reading_index  INTEGER NOT NULL,
+    heart_rate     INTEGER,
+    respiration    REAL,
+    stress         INTEGER,
+    spo2           INTEGER,
+    PRIMARY KEY (snapshot_id, reading_index)
 );
 
 CREATE TABLE IF NOT EXISTS respiration (
@@ -521,11 +602,26 @@ CREATE TABLE IF NOT EXISTS sleep_stats (
 );
 
 CREATE TABLE IF NOT EXISTS health_snapshot (
-    calendar_date           TEXT PRIMARY KEY,
+    snapshot_id             TEXT PRIMARY KEY,
+    calendar_date           TEXT,
     activity_name           TEXT,
     wellness_activity_type  TEXT,
     start_timestamp_local   TEXT,
     end_timestamp_local     TEXT,
+    hr_avg                  INTEGER,
+    hr_min                  INTEGER,
+    hr_max                  INTEGER,
+    respiration_avg         REAL,
+    respiration_min         REAL,
+    respiration_max         REAL,
+    stress_avg              INTEGER,
+    stress_min              INTEGER,
+    stress_max              INTEGER,
+    spo2_avg                INTEGER,
+    spo2_min                INTEGER,
+    spo2_max                INTEGER,
+    rmssd_hrv               REAL,
+    sdrr_hrv                REAL,
     raw_json                TEXT
 );
 
@@ -1322,6 +1418,240 @@ def migrate_stress_max_level(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def migrate_exercise_set_names(conn: sqlite3.Connection) -> None:
+    """Backfill exercise_name/exercise_category from raw_json.
+
+    Before #48 the upsert read top-level exerciseName/exerciseCategory keys,
+    but Garmin nests them in an 'exercises' candidate list, so every set
+    stored by older versions has both columns NULL. Activities with existing
+    details are never re-fetched, so those rows stay empty without this, and
+    garmin_activity_detail drops sets that have neither field.
+    """
+    rows = conn.execute(
+        """SELECT activity_id, set_number, raw_json FROM activity_exercise_sets
+           WHERE exercise_name IS NULL AND exercise_category IS NULL
+             AND json_extract(raw_json, '$.exercises[0]') IS NOT NULL"""
+    ).fetchall()
+    updated = 0
+    for activity_id, set_number, raw in rows:
+        name, category = _best_exercise(json.loads(raw))
+        if name or category:
+            conn.execute(
+                """UPDATE activity_exercise_sets SET exercise_name = ?, exercise_category = ?
+                   WHERE activity_id = ? AND set_number = ?""",
+                (name, category, activity_id, set_number),
+            )
+            updated += 1
+    if updated:
+        log.info("Backfilled exercise names for %d exercise sets", updated)
+    conn.commit()
+
+
+def migrate_training_status_backfill(conn: sqlite3.Connection) -> None:
+    """Re-derive status/acute_load/chronic_load for training_status rows (#85).
+
+    Rows written by older versions left these columns NULL even though
+    raw_json carries latestTrainingStatusData (trainingStatus /
+    trainingStatusFeedbackPhrase + acuteTrainingLoadDTO). The current
+    upsert_training_status() extracts them correctly, so replaying each
+    stored record through it recovers the values. INSERT OR REPLACE keyed on
+    calendar_date means this overwrites only the same row, and the WHERE
+    filter makes it idempotent (a backfilled row has a non-NULL status).
+    """
+    rows = conn.execute(
+        """SELECT calendar_date, raw_json FROM training_status
+           WHERE status IS NULL
+             AND json_valid(raw_json)
+             AND json_type(raw_json, '$.latestTrainingStatusData') = 'object'"""
+    ).fetchall()
+    updated = 0
+    for cal_date, raw in rows:
+        try:
+            record = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        # Pin the write to the row we selected (its stored PK), not the date
+        # embedded in raw_json. Those usually match on the daily path, but the
+        # weekly path stores rows under an explicit cal_date that can differ,
+        # so re-deriving the date risks duplicating or clobbering another day.
+        upsert_training_status(conn, record, cal_date=cal_date)
+        updated += 1
+    if updated:
+        log.info("Backfilled training_status for %d rows", updated)
+    conn.commit()
+
+
+def cleanup_daily_summary_wrappers(conn: sqlite3.Connection) -> None:
+    """Drop pre-#61 daily_summary rows that stored a whole range response (#85).
+
+    Before the #61 date guard, a {"data": [...]} range payload was stored as a
+    single row with a NULL calendar_date (the TEXT primary key allows NULL, so
+    each became a new row instead of replacing anything). Every day inside such
+    a wrapper already exists as a proper per-day row, so these are pure clutter
+    that inflate COUNT(*). Signature-matched and idempotent.
+    """
+    cur = conn.execute(
+        """DELETE FROM daily_summary
+           WHERE calendar_date IS NULL
+             AND json_valid(raw_json)
+             AND json_type(raw_json, '$.data') = 'array'"""
+    )
+    if cur.rowcount:
+        log.info("Removed %d NULL-date daily_summary wrapper rows", cur.rowcount)
+    conn.commit()
+
+
+def cleanup_body_battery_error_rows(conn: sqlite3.Connection) -> None:
+    """Drop body_battery rows that stored a GraphQL error envelope (#85).
+
+    Older versions could persist an error envelope ({"data": ..., "errors":
+    [...]}) as if it were a day's body battery. Current code no longer stores
+    these; this removes the residue. Only rows that carry an errors array AND
+    have no usable data in any column are removed, so a partial-success
+    response (real values plus a warning errors array) is kept. json_valid
+    guards against a legacy malformed row aborting init_db. Idempotent.
+    """
+    cur = conn.execute(
+        """DELETE FROM body_battery
+           WHERE charged IS NULL AND drained IS NULL AND highest IS NULL
+             AND lowest IS NULL AND most_recent IS NULL AND at_wake IS NULL
+             AND during_sleep IS NULL
+             AND json_valid(raw_json)
+             AND json_type(raw_json, '$.errors') = 'array'"""
+    )
+    if cur.rowcount:
+        log.info("Removed %d body_battery error-envelope rows", cur.rowcount)
+    conn.commit()
+
+
+def migrate_spo2_max_backfill(conn: sqlite3.Connection) -> None:
+    """Fill spo2.max_spo2 from the per-minute spo2ValuesArray (#85).
+
+    The payload carries no max key, so older rows (and rows written before the
+    upsert computed it) have max_spo2 NULL even though the readings are present
+    in raw_json. json_valid guards against a malformed legacy row; idempotent
+    (a filled row no longer matches max_spo2 IS NULL).
+    """
+    rows = conn.execute(
+        """SELECT calendar_date, raw_json FROM spo2
+           WHERE max_spo2 IS NULL
+             AND json_valid(raw_json)
+             AND json_type(raw_json, '$.spo2ValuesArray') = 'array'"""
+    ).fetchall()
+    updated = 0
+    for cal_date, raw in rows:
+        try:
+            m = _max_spo2_from_record(json.loads(raw))
+        except (TypeError, ValueError):
+            continue
+        if m is not None:
+            conn.execute("UPDATE spo2 SET max_spo2 = ? WHERE calendar_date = ?", (m, cal_date))
+            updated += 1
+    if updated:
+        log.info("Backfilled spo2 max for %d rows", updated)
+    conn.commit()
+
+
+def migrate_hrv_timestamps_from_timeline(conn: sqlite3.Connection) -> None:
+    """Fill hrv.start_timestamp/end_timestamp from the matching hrv_timeline (#85).
+
+    The HRV summary payload never carries start/end timestamps, but the
+    per-night hrv_timeline payload does, for the same calendar_date (its window
+    sits inside the sleep window). Prefer the Local timestamps, like upsert_hrv.
+    Only rows that still lack a start timestamp and have a VALID matching
+    timeline row are touched; idempotent.
+    """
+    conn.execute(
+        """UPDATE hrv
+           SET start_timestamp = (
+                 SELECT COALESCE(json_extract(t.raw_json, '$.startTimestampLocal'),
+                                 json_extract(t.raw_json, '$.startTimestampGMT'))
+                 FROM hrv_timeline t WHERE t.calendar_date = hrv.calendar_date),
+               end_timestamp = (
+                 SELECT COALESCE(json_extract(t.raw_json, '$.endTimestampLocal'),
+                                 json_extract(t.raw_json, '$.endTimestampGMT'))
+                 FROM hrv_timeline t WHERE t.calendar_date = hrv.calendar_date)
+           WHERE start_timestamp IS NULL
+             AND EXISTS (SELECT 1 FROM hrv_timeline t
+                         WHERE t.calendar_date = hrv.calendar_date
+                           AND json_valid(t.raw_json)
+                           AND (json_extract(t.raw_json, '$.startTimestampLocal') IS NOT NULL
+                                OR json_extract(t.raw_json, '$.startTimestampGMT') IS NOT NULL))"""
+    )
+    conn.commit()
+
+
+def migrate_health_snapshot_schema(conn: sqlite3.Connection) -> None:
+    """Rebuild the pre-#85 health_snapshot table into the per-snapshot schema (#85 #5).
+
+    The old table used calendar_date as PRIMARY KEY (so a second snapshot on the
+    same day overwrote the first) and kept the summary only inside raw_json. The
+    new schema keys on snapshot_id and surfaces the HR/respiration/stress/SpO2/HRV
+    summary as columns. This re-derives both from each old row's raw_json, merged
+    with the old columns, and guarantees every row keeps an id (last resort:
+    calendar_date) so no row is ever silently dropped. Idempotent, and retriable
+    if a previous run was interrupted mid-rebuild.
+    """
+    # Recover from an interrupted earlier run: if the temp table survived, the
+    # rebuild did not finish — restore the original table and start over, so no
+    # rows are left orphaned.
+    leftover = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='_health_snapshot_old'").fetchone()
+    if leftover:
+        conn.execute("DROP TABLE IF EXISTS health_snapshot")
+        conn.execute("ALTER TABLE _health_snapshot_old RENAME TO health_snapshot")
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(health_snapshot)")]
+    if not cols or "snapshot_id" in cols:
+        return  # table absent (fresh install builds the new schema) or already migrated
+
+    old = conn.execute(
+        """SELECT calendar_date, activity_name, wellness_activity_type,
+                  start_timestamp_local, end_timestamp_local, raw_json
+           FROM health_snapshot"""
+    ).fetchall()
+    conn.execute("ALTER TABLE health_snapshot RENAME TO _health_snapshot_old")
+    # Recreate health_snapshot (and no-op every other CREATE IF NOT EXISTS) with
+    # the new schema now that the old table is out of the way.
+    conn.executescript(_SCHEMA_SQL)
+
+    migrated = 0
+    for i, (cal, name, wtype, start, end, raw) in enumerate(old):
+        rec = None
+        if raw:
+            try:
+                rec = json.loads(raw)
+            except (TypeError, ValueError):
+                rec = None
+        if not isinstance(rec, dict):
+            rec = {}
+        # Merge the old columns so an id/field missing from raw_json is still
+        # recovered from the row itself.
+        rec.setdefault("calendarDate", cal)
+        rec.setdefault("activityName", name)
+        rec.setdefault("wellnessActivityType", wtype)
+        rec.setdefault("startTimestampLocal", start)
+        rec.setdefault("endTimestampLocal", end)
+        # Guarantee an id so a legacy row is never silently dropped: prefer the
+        # real identity, fall back to calendar_date, then a synthetic key.
+        if not health_snapshot_id(rec):
+            rec["startTimestampLocal"] = cal or f"legacy-snapshot-{i}"
+        before = conn.total_changes
+        upsert_health_snapshot(conn, rec)
+        migrated += conn.total_changes - before
+
+    conn.execute("DROP TABLE _health_snapshot_old")
+    if migrated != len(old):
+        log.warning(
+            "health_snapshot rebuild: %d of %d rows migrated (%d not re-inserted)",
+            migrated,
+            len(old),
+            len(old) - migrated,
+        )
+    else:
+        log.info("Rebuilt health_snapshot to per-snapshot schema (%d rows)", migrated)
+    conn.commit()
+
+
 def migrate_activity_table(conn: sqlite3.Connection) -> None:
     """Add new columns to activity table and backfill from raw_json.
 
@@ -1497,15 +1827,11 @@ def migrate_hollow_tables(conn: sqlite3.Connection) -> None:
                 "end_timestamp_local": "endTimestampLocal",
             },
         ),
-        (
-            "health_snapshot",
-            {
-                "activity_name": "activityName",
-                "wellness_activity_type": "wellnessActivityType",
-                "start_timestamp_local": "startTimestampLocal",
-                "end_timestamp_local": "endTimestampLocal",
-            },
-        ),
+        # health_snapshot is intentionally omitted: it is now keyed on
+        # snapshot_id (not calendar_date), so a `WHERE calendar_date = ?`
+        # backfill would cross-fill between two same-day snapshots. Its scalar
+        # columns are populated directly by upsert_health_snapshot / the rebuild
+        # migration, so the hollow backfill is no longer needed for it.
     ]:
         rows = conn.execute(f"SELECT calendar_date, raw_json FROM {table} WHERE raw_json IS NOT NULL").fetchall()
         for cal_date, raw in rows:
@@ -1570,6 +1896,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     migrate_floors_totals(conn)
     migrate_health_status(conn)
     migrate_calories_consumed(conn)
+    migrate_exercise_set_names(conn)
+    migrate_training_status_backfill(conn)
+    cleanup_daily_summary_wrappers(conn)
+    cleanup_body_battery_error_rows(conn)
+    migrate_spo2_max_backfill(conn)
+    migrate_hrv_timestamps_from_timeline(conn)
+    migrate_health_snapshot_schema(conn)
 
     # Only run cleanup/backfill when there are rows that actually need it.
     needs_cleanup = conn.execute(
@@ -2461,6 +2794,40 @@ def upsert_stress(conn: sqlite3.Connection, record: dict, cal_date: str = None) 
     )
 
 
+def _max_spo2_from_record(record: dict):
+    """Highest SpO2 reading from the per-minute spo2ValuesArray, or None (#85).
+
+    The payload has no max key (only averageSpO2 / lowestSpO2), but the
+    spo2ValuesArray carries the individual readings. The spo2ValueDescriptorsDTOList
+    gives the column index of the reading value (key 'spo2Reading'); default to
+    index 1 when the descriptor list is absent. Non-numeric / non-positive
+    readings are ignored.
+    """
+    if not isinstance(record, dict):
+        return None
+    arr = record.get("spo2ValuesArray")
+    if not isinstance(arr, list) or not arr:
+        return None
+    idx = 1
+    for desc in record.get("spo2ValueDescriptorsDTOList") or []:
+        # Match the reading column exactly: "reading" as a substring would also
+        # match "readingConfidence", picking the wrong column if Garmin ever
+        # reorders the descriptor list.
+        if isinstance(desc, dict) and str(desc.get("spo2ValueDescriptorKey", "")).lower() == "spo2reading":
+            di = desc.get("spo2ValueDescriptorIndex")
+            if isinstance(di, int):
+                idx = di
+            break
+    best = None
+    for row in arr:
+        if not isinstance(row, (list, tuple)) or len(row) <= idx:
+            continue
+        v = row[idx]
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            best = v if best is None else max(best, v)
+    return best
+
+
 def upsert_spo2(conn: sqlite3.Connection, record: dict, cal_date: str = None) -> None:
     d = cal_date or record.get("calendarDate") or record.get("date")
     if not d:
@@ -2473,12 +2840,90 @@ def upsert_spo2(conn: sqlite3.Connection, record: dict, cal_date: str = None) ->
             d,
             record.get("averageSpo2") or record.get("averageSpO2"),
             record.get("lowestSpo2") or record.get("lowestSpO2"),
-            record.get("latestSpo2") or record.get("latestSpO2"),
+            # No max key in the payload; derive it from the per-minute readings.
+            _max_spo2_from_record(record),
             record.get("numberOfEventsBelowThreshold"),
             record.get("durationOfEventsBelowThreshold"),
             json.dumps(record),
         ),
     )
+
+
+def _is_number(v) -> bool:
+    """True for a real int/float, excluding bool."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _spo2_single_indices(record: dict) -> tuple:
+    """Column indices (timestamp, reading, plottable) for spO2SingleValues rows.
+
+    Defaults match Garmin's order (0=timestamp, 1=spo2Reading,
+    2=singleReadingPlottable); the spO2ValueDescriptorsDTOList overrides them by
+    exact key when present.
+    """
+    ti, ri, pi = 0, 1, 2
+    for desc in record.get("spO2ValueDescriptorsDTOList") or record.get("spo2ValueDescriptorsDTOList") or []:
+        if not isinstance(desc, dict):
+            continue
+        di = desc.get("spo2ValueDescriptorIndex")
+        if not isinstance(di, int):
+            continue
+        key = str(desc.get("spo2ValueDescriptorKey", "")).lower()
+        if key == "timestamp":
+            ti = di
+        elif key == "spo2reading":
+            ri = di
+        elif key in ("singlereadingplottable", "plottable"):
+            pi = di
+    return ti, ri, pi
+
+
+def upsert_spo2_spot(conn: sqlite3.Connection, record: dict, cal_date: str = None) -> int:
+    """Store on-demand/daytime SpO2 spot checks and hourly averages (#86).
+
+    From wellness/daily/spo2, which is complementary to the dailySpo2 endpoint
+    the `spo2` table is built from: dailySpo2 has the per-minute sleep array,
+    this one has the individual spot checks (spO2SingleValues) and the hourly
+    averages (spO2HourlyAverages) that otherwise never reach the database.
+    Returns the number of reading/average rows written.
+    """
+    d = cal_date or record.get("calendarDate") or record.get("date")
+    if not d:
+        return 0
+    n = 0
+
+    singles = record.get("spO2SingleValues")
+    if isinstance(singles, list):
+        ti, ri, pi = _spo2_single_indices(record)
+        for row in singles:
+            if not isinstance(row, (list, tuple)) or len(row) <= max(ti, ri):
+                continue
+            ts, val = row[ti], row[ri]
+            if not _is_number(ts) or not _is_number(val):
+                continue
+            plot = row[pi] if len(row) > pi else None
+            conn.execute(
+                "INSERT OR REPLACE INTO spo2_spot_reading "
+                "(calendar_date, reading_timestamp, spo2, plottable) VALUES (?, ?, ?, ?)",
+                (d, int(ts), val, (1 if plot else 0) if plot is not None else None),
+            )
+            n += 1
+
+    hourly = record.get("spO2HourlyAverages")
+    if isinstance(hourly, list):
+        for row in hourly:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            ts, val = row[0], row[1]
+            if not _is_number(ts) or not _is_number(val):
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO spo2_hourly_average (calendar_date, hour_timestamp, avg_spo2) VALUES (?, ?, ?)",
+                (d, int(ts), val),
+            )
+            n += 1
+
+    return n
 
 
 def upsert_respiration(conn: sqlite3.Connection, record: dict, cal_date: str = None) -> None:
@@ -3003,6 +3448,39 @@ def upsert_endurance_score(conn: sqlite3.Connection, record: dict, cal_date: str
     )
 
 
+def upsert_load_focus(conn: sqlite3.Connection, record: dict, cal_date: str = None) -> None:
+    """Store Garmin's training load balance ("Load Focus") for one day.
+
+    The payload is keyed by device ID; prefer the primary training device.
+    Monthly loads per zone go into columns, the target ranges stay in raw_json.
+    """
+    dto_map = record.get("metricsTrainingLoadBalanceDTOMap")
+    if not isinstance(dto_map, dict) or not dto_map:
+        return
+    dtos = [v for v in dto_map.values() if isinstance(v, dict)]
+    dto = next((v for v in dtos if v.get("primaryTrainingDevice")), dtos[0] if dtos else None)
+    if not dto:
+        return
+    # The endpoint returns the latest value *as of* the requested date, so the
+    # DTO's own calendarDate is the day the balance was actually computed.
+    d = dto.get("calendarDate") or cal_date
+    if not d:
+        return
+    conn.execute(
+        """INSERT OR REPLACE INTO load_focus
+           (calendar_date, anaerobic, high_aerobic, low_aerobic, focus_status, raw_json)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            d,
+            dto.get("monthlyLoadAnaerobic"),
+            dto.get("monthlyLoadAerobicHigh"),
+            dto.get("monthlyLoadAerobicLow"),
+            dto.get("trainingBalanceFeedbackPhrase"),
+            json.dumps(dto),
+        ),
+    )
+
+
 def upsert_hill_score(conn: sqlite3.Connection, record: dict, cal_date: str = None) -> None:
     d = cal_date or record.get("calendarDate") or record.get("date")
     if not d:
@@ -3143,6 +3621,13 @@ def upsert_activity_weather(conn: sqlite3.Connection, activity_id: int, data) ->
     )
 
 
+def _best_exercise(s: dict) -> tuple:
+    """Return (name, category) of the most likely exercise for one set."""
+    exercises = s.get("exercises") or []
+    best = max(exercises, key=lambda e: e.get("probability") or 0) if exercises else {}
+    return best.get("name") or s.get("exerciseName"), best.get("category") or s.get("exerciseCategory")
+
+
 def upsert_activity_exercise_sets(conn: sqlite3.Connection, activity_id: int, data) -> int:
     if not data:
         return 0
@@ -3153,10 +3638,7 @@ def upsert_activity_exercise_sets(conn: sqlite3.Connection, activity_id: int, da
         # each set. That list is a ranked set of candidate classifications, each
         # with a 'probability' — pick the most likely one rather than assuming
         # list order. Fall back to top-level keys for backward compatibility.
-        exercises = s.get("exercises") or []
-        best_exercise = max(exercises, key=lambda e: e.get("probability") or 0) if exercises else {}
-        exercise_name = best_exercise.get("name") or s.get("exerciseName")
-        exercise_category = best_exercise.get("category") or s.get("exerciseCategory")
+        exercise_name, exercise_category = _best_exercise(s)
         # repetitionCount can legitimately be 0 (e.g. a timed hold); only fall
         # back to 'reps' when the key is genuinely absent, not when it is 0.
         reps = s.get("repetitionCount")
@@ -3358,24 +3840,113 @@ def upsert_sleep_stats(conn, record):
         _upsert_raw_only(conn, "sleep_stats", "calendar_date", record, d)
 
 
+def health_snapshot_id(record: dict) -> Optional[str]:
+    """Stable per-snapshot id: activityUuid.uuid, else the local start time.
+
+    Keying on this (rather than calendar_date) lets two snapshots on the same
+    day coexist instead of the second overwriting the first.
+    """
+    uuid = record.get("activityUuid")
+    if isinstance(uuid, dict) and uuid.get("uuid"):
+        return str(uuid["uuid"])
+    if isinstance(uuid, str) and uuid:
+        return uuid
+    return record.get("startTimestampLocal") or None
+
+
+_SNAPSHOT_SUMMARY_COLUMNS = {
+    "HEART_RATE": ("hr_avg", "hr_min", "hr_max"),
+    "RESPIRATION": ("respiration_avg", "respiration_min", "respiration_max"),
+    "STRESS": ("stress_avg", "stress_min", "stress_max"),
+    "SPO2": ("spo2_avg", "spo2_min", "spo2_max"),
+    "RMSSD_HRV": ("rmssd_hrv", None, None),
+    "SDRR_HRV": ("sdrr_hrv", None, None),
+}
+
+
+def _snapshot_summary(record: dict) -> dict:
+    """Flatten summaryTypeDataList into {column: value} for the snapshot columns."""
+    out = {}
+    for item in record.get("summaryTypeDataList") or []:
+        if not isinstance(item, dict):
+            continue
+        cols = _SNAPSHOT_SUMMARY_COLUMNS.get(item.get("summaryType"))
+        if not cols:
+            continue
+        avg_col, min_col, max_col = cols
+        if avg_col:
+            out[avg_col] = item.get("avgValue")
+        if min_col:
+            out[min_col] = item.get("minValue")
+        if max_col:
+            out[max_col] = item.get("maxValue")
+    return out
+
+
+_SNAPSHOT_COLUMNS = [
+    "snapshot_id",
+    "calendar_date",
+    "activity_name",
+    "wellness_activity_type",
+    "start_timestamp_local",
+    "end_timestamp_local",
+    "hr_avg",
+    "hr_min",
+    "hr_max",
+    "respiration_avg",
+    "respiration_min",
+    "respiration_max",
+    "stress_avg",
+    "stress_min",
+    "stress_max",
+    "spo2_avg",
+    "spo2_min",
+    "spo2_max",
+    "rmssd_hrv",
+    "sdrr_hrv",
+    "raw_json",
+]
+
+
 def upsert_health_snapshot(conn, record):
-    d = record.get("calendarDate") or record.get("date")
-    if not d:
+    sid = health_snapshot_id(record)
+    if not sid:
         return
+    summary = _snapshot_summary(record)
+    values = {
+        "snapshot_id": sid,
+        "calendar_date": record.get("calendarDate") or record.get("date"),
+        "activity_name": record.get("activityName"),
+        "wellness_activity_type": record.get("wellnessActivityType"),
+        "start_timestamp_local": record.get("startTimestampLocal"),
+        "end_timestamp_local": record.get("endTimestampLocal"),
+        "raw_json": json.dumps(record),
+        **summary,
+    }
+    cols = _SNAPSHOT_COLUMNS
     conn.execute(
-        """INSERT OR REPLACE INTO health_snapshot
-           (calendar_date, activity_name, wellness_activity_type,
-            start_timestamp_local, end_timestamp_local, raw_json)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (
-            d,
-            record.get("activityName"),
-            record.get("wellnessActivityType"),
-            record.get("startTimestampLocal"),
-            record.get("endTimestampLocal"),
-            json.dumps(record),
-        ),
+        f"INSERT OR REPLACE INTO health_snapshot ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+        tuple(values.get(c) for c in cols),
     )
+
+
+def upsert_health_snapshot_readings(conn, snapshot_id, readings) -> int:
+    """Store per-second Health Snapshot graph readings for one snapshot (#86).
+
+    ``readings`` is a list of (reading_index, heart_rate, respiration, stress,
+    spo2) tuples as produced by parse_health_snapshot_fit. Keyed on
+    (snapshot_id, reading_index) so re-ingesting the same snapshot replaces its
+    rows rather than duplicating. Returns the number of rows written.
+    """
+    if not snapshot_id or not readings:
+        return 0
+    conn.executemany(
+        """INSERT OR REPLACE INTO health_snapshot_reading
+           (snapshot_id, reading_index, heart_rate, respiration, stress, spo2)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [(snapshot_id, idx, hr, resp, st, sp) for (idx, hr, resp, st, sp) in readings],
+    )
+    return len(readings)
 
 
 def upsert_workout_schedule(conn, record):
@@ -3669,6 +4240,7 @@ _DAILY_SIGNAL_FIELDS = {
     "heart_rate_detail": ("restingHeartRate", "minHeartRate", "maxHeartRate", "heartRateValues"),
     "stress": ("avgStressLevel", "maxStressLevel", "stressValuesArray"),
     "spo2": ("averageSpO2", "lowestSpO2", "latestSpO2", "spo2ValuesArray"),
+    "spo2_spot": ("spO2SingleValues", "spO2HourlyAverages", "latestSpO2", "avgSleepSpO2"),
     "respiration": (
         "avgWakingRespirationValue",
         "avgSleepRespirationValue",
@@ -3684,6 +4256,7 @@ _DAILY_SIGNAL_FIELDS = {
     "training_status_daily": ("latestTrainingStatusData",),
     "training_status_weekly": ("latestTrainingStatusData",),
     "training_status": ("latestTrainingStatusData",),
+    "training_load_balance": ("metricsTrainingLoadBalanceDTOMap",),
 }
 
 
@@ -3802,6 +4375,10 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
             for rec in records:
                 upsert_spo2(conn, rec, cal_date)
                 count += 1
+
+        elif name == "spo2_spot":
+            for rec in records:
+                count += upsert_spo2_spot(conn, rec, cal_date)
 
         elif name == "respiration":
             for rec in records:
@@ -4048,6 +4625,11 @@ def save_to_db(conn: sqlite3.Connection, endpoint_name: str, data, cal_date: str
         elif name == "hill_score":
             for rec in records:
                 upsert_hill_score(conn, rec, cal_date)
+                count += 1
+
+        elif name == "training_load_balance":
+            for rec in records:
+                upsert_load_focus(conn, rec, cal_date)
                 count += 1
 
         elif name == "race_predictions":

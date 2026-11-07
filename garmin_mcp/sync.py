@@ -1,8 +1,8 @@
 """
 Incremental sync module for Garmin MCP server.
 
-Fetches today's and yesterday's data from Garmin Connect and saves it
-directly to SQLite via save_to_db().
+Fetches everything since the last successful sync (at least yesterday and
+today) from Garmin Connect and saves it directly to SQLite via save_to_db().
 """
 
 import fcntl
@@ -14,6 +14,29 @@ from pathlib import Path
 from garmin_mcp.db import DB_PATH, get_connection, init_db, save_to_db
 
 logger = logging.getLogger(__name__)
+
+# How far back the default (catch-up) window may reach. Longer gaps need an
+# explicit start_date so a single MCP sync stays within its timeout.
+MAX_CATCH_UP_DAYS = 30
+
+
+def _catch_up_start(conn, today: str) -> str:
+    """Default start of the sync window: the day before the last successful
+    sync, clamped to [today - MAX_CATCH_UP_DAYS, yesterday].
+
+    A fixed yesterday-to-today window silently skips every day between the
+    previous sync and yesterday, so activities recorded in that gap were
+    never fetched.
+    """
+    today_d = date.fromisoformat(today)
+    yesterday = today_d - timedelta(days=1)
+    row = conn.execute("SELECT MAX(sync_date) FROM sync_log WHERE status = 'ok'").fetchone()
+    try:
+        last_sync = datetime.fromisoformat(row[0]).date()
+    except (TypeError, ValueError, IndexError):
+        return yesterday.isoformat()
+    start = min(last_sync - timedelta(days=1), yesterday)
+    return max(start, today_d - timedelta(days=MAX_CATCH_UP_DAYS)).isoformat()
 
 
 def _parse_trackpoints_for_activities(conn, activity_ids):
@@ -48,7 +71,11 @@ def _parse_trackpoints_for_activities(conn, activity_ids):
 
 
 def incremental_sync(
-    target_date: str = None, start_date: str = None, save_raw: bool = False, parse_trackpoints: bool = True
+    target_date: str = None,
+    start_date: str = None,
+    save_raw: bool = False,
+    parse_trackpoints: bool = True,
+    refetch_recent_days: int = None,
 ) -> dict:
     """Fetch today's data from Garmin and save directly to the database.
 
@@ -59,7 +86,9 @@ def incremental_sync(
         the actual current date.
     start_date:
         ISO date string (``YYYY-MM-DD``) for the beginning of the fetch range.
-        Defaults to yesterday (incremental). Set to an early date for full-history sync.
+        Defaults to the day before the last successful sync (at most
+        ``MAX_CATCH_UP_DAYS`` back, at least yesterday). Set to an early date
+        for full-history sync.
     save_raw:
         Whether to save raw JSON responses under the ``debug/raw`` directory
         (next to ``browser_profile``).
@@ -91,25 +120,22 @@ def incremental_sync(
                 "status": "error",
                 "message": f"start_date ({start_date}) must be on or before target_date ({today})",
             }
-    effective_start = start_date or yesterday
     is_backfill = start_date is not None and start_date != yesterday
 
-    PROJECT_DIR = Path(__file__).parent.parent
-    PROFILE_DIR = PROJECT_DIR / "browser_profile"
+    # Resolve credentials, browser profile and session from the real data
+    # directory (GARMIN_DATA_DIR / cwd / ~/.garmin-givemydata), not the
+    # installed package location. On pip/pipx/brew installs the package lives
+    # in site-packages, where no .env exists, so the sync always failed with
+    # "Credentials not found". Same fix as #63 for the export path.
+    from garmin_givemydata import DATA_DIR, PROFILE_DIR, SESSION_FILE, load_env
 
     # When launched as an MCP server, the host's CWD may be a system path
     # with no write access (e.g. C:\Windows\System32 on Windows). SeleniumBase
     # creates downloaded_files/ relative to CWD, which then crashes the sync
-    # with PermissionError. Move into PROJECT_DIR. See issue #35.
-    os.chdir(str(PROJECT_DIR))
+    # with PermissionError. Move into DATA_DIR. See issue #35.
+    os.chdir(str(DATA_DIR))
 
-    env_file = PROJECT_DIR / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                os.environ.setdefault(key.strip(), value.strip())
+    load_env()
 
     email = os.environ.get("GARMIN_EMAIL", "")
     password = os.environ.get("GARMIN_PASSWORD", "")
@@ -141,9 +167,26 @@ def incremental_sync(
         conn = get_connection()
         init_db(conn)
 
+        effective_start = start_date or _catch_up_start(conn, today)
+
+        # Re-fetch details for recently-started activities so edits made after the
+        # first sync (e.g. self-evaluation feel/RPE, only present in the details
+        # payload) are picked up. #85 finding 4.
+        from garmin_mcp.db import DEFAULT_REFETCH_RECENT_DAYS, recent_activity_ids, widen_start_for_refetch
+
+        if refetch_recent_days is None:
+            refetch_recent_days = DEFAULT_REFETCH_RECENT_DAYS
+        # On the auto (incremental/catch-up) path, widen the fetch start to cover the
+        # re-fetch window — otherwise a recent activity is dropped from the skip-set
+        # but never appears in the fetched activity list, so its late edits are still
+        # missed. An explicit start_date is respected as-is.
+        if start_date is None:
+            effective_start = widen_start_for_refetch(effective_start, today, refetch_recent_days)
+
         # Build set of already-fetched activity IDs so fetch_all() skips them
         existing = conn.execute("SELECT DISTINCT activity_id FROM activity_splits").fetchall()
         known_activity_ids = {row[0] for row in existing}
+        known_activity_ids -= recent_activity_ids(conn, today, refetch_recent_days)
         if known_activity_ids:
             logger.info("Skipping %d activities with existing details", len(known_activity_ids))
 
@@ -160,7 +203,6 @@ def incremental_sync(
                 except (ValueError, TypeError):
                     pass
 
-        SESSION_FILE = PROJECT_DIR / "garmin_session.json"
         client = GarminClient(
             email=email,
             password=password,
@@ -234,7 +276,7 @@ if __name__ == "__main__":
         epilog="Example: python -m garmin_mcp.sync --start-date 2018-01-01 (full history backfill)",
     )
     parser.add_argument("target_date", nargs="?", help="YYYY-MM-DD (default: today)")
-    parser.add_argument("--start-date", help="YYYY-MM-DD start of range (default: yesterday)")
+    parser.add_argument("--start-date", help="YYYY-MM-DD start of range (default: day before last sync)")
     args = parser.parse_args()
     result = incremental_sync(target_date=args.target_date, start_date=args.start_date)
     print(result)
